@@ -1,0 +1,12 @@
+[package]
+name = "perf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vulkano = "0.35.1"
+vulkano-shaders = "0.35.0"
+foldhash = "0.1"
+
+[profile.release]
+debug = true
