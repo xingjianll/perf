@@ -41,12 +41,30 @@ mod cs {
             ("ALIGNED",    "1"),
             ("B_TYPE",   "vec4"),
             ("D_TYPE", "float"),
+            // Current baseline matches the README's measured numbers (fp32 inner-loop).
             ("FLOAT_TYPE", "float"),
             ("FLOAT_TYPEV2", "vec2"),
             ("FLOAT_TYPEV4", "vec4"),
             ("FLOAT_TYPEV8", "mat2x4"),
             ("ACC_TYPE", "float"),
             ("ACC_TYPEV2", "vec2"),
+            //
+            // TO SWAP IN THE fp16 INNER-LOOP VARIANT (matches llama.cpp's
+            // matmul_shaders(fp16=true, f16acc=false) for Apple GPUs): comment out the
+            // 6 lines above and uncomment the block below. Also re-run on macOS to
+            // refresh the MoltenVK numbers in the README before reporting comparisons.
+            //
+            // Measured on Honeykrisp (M1 Ultra, Mesa 25.2.7): per-dispatch dropped
+            // 35.23 ms -> 19.44 ms (1707 -> 3093 GFLOPS, +81%). shared_size dropped
+            // 17408 -> 8704 bytes (1 WG/core -> 3 WGs/core, on a 32 KB budget).
+            //
+            // ("FLOAT_TYPE",   "float16_t"),
+            // ("FLOAT_TYPEV2", "f16vec2"),
+            // ("FLOAT_TYPEV4", "f16vec4"),
+            // ("FLOAT_TYPEV8", "f16mat2x4"),
+            // ("FLOAT16",      "1"),
+            // ("ACC_TYPE",     "float"),
+            // ("ACC_TYPEV2",   "vec2"),
         ],
         vulkan_version: "1.2",
     }
@@ -144,9 +162,9 @@ fn main() {
     let queue = queues.next().unwrap();
 
     // ------------------------------------------------------------------ Tile config
-    // BM=BN=64, WM=WN=32 -> NUM_WARPS=4
-    // WMITER=2, TM=4, TN=2, WARP=32 -> WNITER=2, BLOCK_SIZE=128.
-    // BK=32 must be set explicitly for quantized variants (spec const id=3).
+    // Matches llama.cpp's m_warptile_mmq for Apple (non-coopmat2) Q4_K path:
+    // { 128, 64, 64, 32, 32, 32, 2, 4, 2, 1, 32 }
+    //   BS  BM  BN  BK  WM  WN  WMITER TM TN TK WARP
     const BLOCK_SIZE: u32 = 128;
     const BM: u32 = 64;
     const BN: u32 = 64;
