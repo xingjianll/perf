@@ -74,7 +74,35 @@ underlying kernel is only ~148 µs.
 Tile config: `BM=BN=64, WM=WN=32, WMITER=2, TM=4, TN=2, WARP=32, BLOCK_SIZE=128`.
 20 iterations after 3 warmup, single-dispatch wall-clock timing.
 
+## AGX disassembly
+
+`dumps/` contains AGX (Apple GPU ISA) disassembly for both kernels as produced by
+MoltenVK → Metal → Apple's AGX compiler on macOS:
+
+| File | Format |
+|---|---|
+| `add_agx.bin`, `matmul_agx.bin`     | Raw AGX `__text` bytes  |
+| `*_moltenvk.mesa.s`                  | Disassembly via Mesa's `src/asahi/isa/test/disasm.py` (Alyssa Rosenzweig's XML-driven decoder) |
+| `*_moltenvk.agx.s`                   | Disassembly via [applegpu](https://github.com/dougallj/applegpu) (Dougall Johnson) |
+
+Re-generate after an edit with:
+```
+python3 dumps/extract_agx.py add matmul
+```
+
+The script wipes `$(getconf DARWIN_USER_CACHE_DIR)com.apple.metal/<gpu>/functions.{data,list}`,
+runs each binary, then parses the resulting Mach-O object in `functions.data` to pull out
+the `__text` section. Apple stores each compiled compute pipeline as a Mach-O 64
+with cputype `0x01000013` (AGX).
+
+The Asahi counterpart is one env var:
+```
+AGX_MESA_DEBUG=shaders ./target/release/add 2> dumps/add_asahi.mesa.s
+```
+Mesa's AGX backend uses the same disassembler module, so `add_asahi.mesa.s` and
+`add_moltenvk.mesa.s` are formatted identically and directly diff-able.
+
 ## TODO
 
-- Sweep tile config (BM/BN/WM/WN/TM/TN) per driver.
-- Diff AGX assembly between MoltenVK→Metal→AGX and Honeykrisp→AGX paths.
+- Run extract_agx.py output and the asahi-side dump on the Asahi machine.
+- Diff instruction-mix / register pressure / shmem usage between the two paths.
