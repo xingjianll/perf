@@ -1,9 +1,13 @@
-// Minimum harness for llama.cpp's Vulkan F32xF32 matmul kernel (mul_mm.comp).
+// Harness for llama.cpp's Vulkan q4_K x f32 matmul kernel (mul_mm.comp,
+// DATA_A_Q4_K variant). Computes  D = A @ B^T  where A is q4_K-quantized.
 //
-// Computes  D[m, n] = sum_k A[m, k] * B[n, k]   i.e.  D = A @ B^T
-//   A is M x K, row-major (data_a[m*K + k])
-//   B is N x K, row-major (data_b[n*K + k])
-//   D is M x N, column-major (data_d[n*M + m])
+//   A is M x K, q4_K-quantized (256 elements per 144-byte block, row-major)
+//   B is N x K, row-major f32 (data_b[n*K + k])
+//   D is M x N, column-major f32 (data_d[n*M + m])
+//
+// Shape M=4096, N=4, K=14336 mirrors the test-backend-ops case
+// "MUL_MAT type_a=q4_K m=4096 n=4 k=14336" which had the largest
+// MoltenVK vs Honeykrisp gap in the spreadsheet (~8x).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -13,7 +17,7 @@ use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
 use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage};
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::device::{Device, DeviceCreateInfo, QueueCreateInfo, QueueFlags};
+use vulkano::device::{Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, QueueCreateInfo, QueueFlags};
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo, InstanceExtensions};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::pipeline::compute::ComputePipelineCreateInfo;
@@ -31,9 +35,11 @@ mod cs {
         path: "shaders/mul_mm.comp",
         include: ["shaders"],
         define: [
-            ("DATA_A_F32", "1"),
-            ("LOAD_VEC_A", "1"),
-            ("B_TYPE", "float"),
+            ("DATA_A_Q4_K", "1"),
+            ("LOAD_VEC_A", "4"),
+            ("LOAD_VEC_B", "4"),
+            ("ALIGNED",    "1"),
+            ("B_TYPE",   "vec4"),
             ("D_TYPE", "float"),
             ("FLOAT_TYPE", "float"),
             ("FLOAT_TYPEV2", "vec2"),
@@ -67,6 +73,13 @@ struct PushConstants {
     broadcast3: u32,
 }
 
+// q4_K block layout: 256 weights per block, 144 bytes per block.
+//   f16 d, f16 dmin   ( 4B)
+//   uint8_t scales[12] (12B)
+//   uint8_t qs[128]   (128B)
+const QUANT_K: u32 = 256;
+const Q4_K_BYTES: usize = 144;
+
 fn main() {
     // ------------------------------------------------------------------ Vulkan setup
     let library = VulkanLibrary::new().expect("no Vulkan library");
@@ -96,6 +109,25 @@ fn main() {
         .position(|q| q.queue_flags.contains(QueueFlags::COMPUTE))
         .unwrap() as u32;
 
+    // q4_K shader uses uint8_t / uint16_t / float16_t in storage buffers.
+    // We must enable matching device features and core-1.2 promoted extensions.
+    let enabled_features = DeviceFeatures {
+        shader_int8: true,
+        shader_int16: true,
+        shader_float16: true,
+        storage_buffer8_bit_access: true,
+        uniform_and_storage_buffer8_bit_access: true,
+        storage_buffer16_bit_access: true,
+        uniform_and_storage_buffer16_bit_access: true,
+        ..DeviceFeatures::empty()
+    };
+    let enabled_extensions = DeviceExtensions {
+        khr_8bit_storage: true,
+        khr_16bit_storage: true,
+        khr_shader_float16_int8: true,
+        ..DeviceExtensions::empty()
+    };
+
     let (device, mut queues) = Device::new(
         physical,
         DeviceCreateInfo {
@@ -103,6 +135,8 @@ fn main() {
                 queue_family_index,
                 ..Default::default()
             }],
+            enabled_extensions,
+            enabled_features,
             ..Default::default()
         },
     )
@@ -110,17 +144,13 @@ fn main() {
     let queue = queues.next().unwrap();
 
     // ------------------------------------------------------------------ Tile config
-    // These must satisfy the kernel's invariants:
-    //   NUM_WARPS = (BM/WM) * (BN/WN)
-    //   BLOCK_SIZE = WARP * NUM_WARPS
-    //   WNITER = (WM*WN) / (WARP*TM*TN*WMITER)
-    //   WARP = (WSUBM/TM) * (WSUBN/TN)
-    //
-    // Pick: BM=BN=64, WM=WN=32 -> NUM_WARPS=4
-    //       WMITER=2, TM=4, TN=2, WARP=32 -> WNITER=2, BLOCK_SIZE=128.
+    // BM=BN=64, WM=WN=32 -> NUM_WARPS=4
+    // WMITER=2, TM=4, TN=2, WARP=32 -> WNITER=2, BLOCK_SIZE=128.
+    // BK=32 must be set explicitly for quantized variants (spec const id=3).
     const BLOCK_SIZE: u32 = 128;
     const BM: u32 = 64;
     const BN: u32 = 64;
+    const BK: u32 = 32;
     const WM: u32 = 32;
     const WN: u32 = 32;
     const WMITER: u32 = 2;
@@ -133,7 +163,7 @@ fn main() {
     spec.insert(0, SpecializationConstant::U32(BLOCK_SIZE));
     spec.insert(1, SpecializationConstant::U32(BM));
     spec.insert(2, SpecializationConstant::U32(BN));
-    // id=3 is BK -- skipped because for DATA_A_F32 the shader hardcodes BK=32.
+    spec.insert(3, SpecializationConstant::U32(BK));
     spec.insert(4, SpecializationConstant::U32(WM));
     spec.insert(5, SpecializationConstant::U32(WN));
     spec.insert(6, SpecializationConstant::U32(WMITER));
@@ -146,7 +176,6 @@ fn main() {
     let shader = cs::load(device.clone()).unwrap();
     let specialized = shader.specialize(spec).unwrap();
     let entry = specialized.entry_point("main").unwrap();
-
     let stage = PipelineShaderStageCreateInfo::new(entry);
 
     let layout = PipelineLayout::new(
@@ -165,18 +194,35 @@ fn main() {
     .expect("compute pipeline");
 
     // ------------------------------------------------------------------ Problem
-    let m: u32 = 1024;
-    let n: u32 = 1024;
-    let k: u32 = 1024;
+    // Match llama.cpp's "mul_mm.comp" dispatch case: m=4096, n=512, k=14336.
+    // At n=512 llama.cpp uses mul_mm.comp (medium-tile, aligned variant) on M1 Ultra.
+    let m: u32 = 4096;
+    let n: u32 = 512;
+    let k: u32 = 14336;
 
-    let a_len = (m * k) as usize;
+    assert!(k % QUANT_K == 0, "K must be a multiple of {}", QUANT_K);
+
+    let a_blocks = (m as usize) * (k as usize) / QUANT_K as usize;
+    let a_bytes = a_blocks * Q4_K_BYTES;
     let b_len = (n * k) as usize;
     let d_len = (m * n) as usize;
 
-    // Deterministic but non-periodic inputs (so each row of A/B is distinct).
-    let a_data: Vec<f32> = (0..a_len)
-        .map(|i| (i as f32 * 0.12345 + 0.7).sin() * 0.5)
-        .collect();
+    println!(
+        "M={} N={} K={}  A={} blocks ({:.1} MB)  B={:.1} KB  D={:.1} KB",
+        m, n, k,
+        a_blocks,
+        a_bytes as f64 / 1e6,
+        (b_len * 4) as f64 / 1e3,
+        (d_len * 4) as f64 / 1e3,
+    );
+
+    // q4_K block bytes. Zero-fill is a valid (if degenerate) q4_K block:
+    // d=0, dmin=0, scales=0, qs=0 -> dequant returns zero everywhere.
+    // The shader still runs the full load + dequant + FMA + store path,
+    // so timing is meaningful even though D will be all zeros.
+    let a_data: Vec<u8> = vec![0u8; a_bytes];
+
+    // B as deterministic non-trivial f32 data (not used for verification).
     let b_data: Vec<f32> = (0..b_len)
         .map(|i| (i as f32 * 0.07891 - 0.3).sin() * 0.5)
         .collect();
@@ -239,8 +285,6 @@ fn main() {
     .unwrap();
 
     // ------------------------------------------------------------------ Push constants / dispatch
-    // k_split is K-elements processed per workgroup along K (not the number of splits).
-    // For a single split that covers all of K we set k_split = K.
     let num_splits: u32 = 1;
     let k_split = k.div_ceil(num_splits);
 
@@ -266,14 +310,18 @@ fn main() {
     let blocks_m = (m + BM - 1) / BM;
     let blocks_n = (n + BN - 1) / BN;
     let groups = [blocks_m * num_splits, blocks_n, push.num_batches];
+    println!("dispatch: workgroups=({},{},{})  ({} total)", groups[0], groups[1], groups[2], groups[0]*groups[1]*groups[2]);
 
     let cb_alloc = Arc::new(StandardCommandBufferAllocator::new(
         device.clone(),
         Default::default(),
     ));
 
-    // Submit a single dispatch and wait for it.
-    let run_once = || {
+    // Pack N_INNER dispatches into a single command buffer per submission to
+    // amortize the vkQueueSubmit + vkWaitForFences round-trip.
+    const N_INNER: u32 = 16;
+
+    let run_batch = |n_inner: u32| {
         let mut builder = AutoCommandBufferBuilder::primary(
             cb_alloc.clone(),
             queue.queue_family_index(),
@@ -292,9 +340,10 @@ fn main() {
                 )
                 .unwrap()
                 .push_constants(pipeline.layout().clone(), 0, push)
-                .unwrap()
-                .dispatch(groups)
                 .unwrap();
+            for _ in 0..n_inner {
+                builder.dispatch(groups).unwrap();
+            }
         }
         let cb = builder.build().unwrap();
         sync::now(device.clone())
@@ -305,49 +354,37 @@ fn main() {
             .wait(None)
             .unwrap();
     };
+    let run_once = || run_batch(1);
 
-    // ------------------------------------------------------------------ Verify a few entries
+    // ------------------------------------------------------------------ Sanity
     run_once();
     let d_view = d_buf.read().unwrap();
-
-    // Random-ish sample of (m, n) coords.
-    let samples = [(0, 0), (1, 1), (37, 411), (m - 1, n - 1), (m / 2, n / 2)];
-    let mut max_err: f32 = 0.0;
-    for &(mm, nn) in &samples {
-        let mut acc = 0.0f64;
-        for kk in 0..k {
-            acc += (a_data[(mm * k + kk) as usize] as f64)
-                * (b_data[(nn * k + kk) as usize] as f64);
-        }
-        let gpu = d_view[(nn * m + mm) as usize];
-        let err = (gpu as f64 - acc).abs() as f32;
-        max_err = max_err.max(err);
-        println!("D[{:>4},{:>4}]  gpu={:>11.4}  cpu={:>11.4}  err={:.2e}", mm, nn, gpu, acc, err);
-    }
+    let any_nan = d_view.iter().any(|x| x.is_nan() || x.is_infinite());
+    println!("output: nan/inf? {}    sample d[0..4]={:?}", any_nan, &d_view[0..4]);
     drop(d_view);
-    println!("max abs err over samples: {:.3e}", max_err);
 
     // ------------------------------------------------------------------ Perf
     let warmup = 3;
-    let iters = 20;
+    let outer_iters: u32 = 10;
     for _ in 0..warmup {
-        run_once();
+        run_batch(N_INNER);
     }
     let t0 = Instant::now();
-    for _ in 0..iters {
-        run_once();
+    for _ in 0..outer_iters {
+        run_batch(N_INNER);
     }
     let elapsed = t0.elapsed();
-    let per_run = elapsed / iters;
+    let total_dispatches = outer_iters * N_INNER;
+    let per_run = elapsed / total_dispatches;
     let flops_per_run = 2.0 * (m as f64) * (n as f64) * (k as f64);
     let gflops = flops_per_run / per_run.as_secs_f64() / 1e9;
 
     println!(
-        "M=N=K={}  BM={} BN={} WM={} WN={} WMITER={} TM={} TN={} WARP={} BLOCK_SIZE={}",
-        m, BM, BN, WM, WN, WMITER, TM, TN, WARP, BLOCK_SIZE
+        "tile: BM={} BN={} BK={} WM={} WN={} WMITER={} TM={} TN={} WARP={} BLOCK_SIZE={}",
+        BM, BN, BK, WM, WN, WMITER, TM, TN, WARP, BLOCK_SIZE
     );
     println!(
-        "iters={}  total={:?}  per-run={:?}  {:.1} GFLOPS",
-        iters, elapsed, per_run, gflops
+        "outer_iters={}  inner_batch={}  total_dispatches={}  total={:?}  per-dispatch={:?}  {:.1} GFLOPS",
+        outer_iters, N_INNER, total_dispatches, elapsed, per_run, gflops
     );
 }
