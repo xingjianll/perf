@@ -98,6 +98,95 @@ struct PushConstants {
 const QUANT_K: u32 = 256;
 const Q4_K_BYTES: usize = 144;
 
+// ---------------------------------------------------------------- CPU reference
+// Deterministic PRNG (splitmix64-style) so test data is reproducible run-to-run.
+fn prng(state: &mut u64) -> u32 {
+    *state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    let mut x = *state;
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+    ((x >> 32) ^ x) as u32
+}
+
+// Generate one 144-byte q4_K block with varied, non-degenerate content.
+// d/dmin are written as IEEE half via the `half` crate so the GPU's hardware
+// f16->f32 and our CPU reference agree bit-for-bit.
+fn gen_q4k_block(block_idx: usize, out: &mut [u8]) {
+    let mut state = (block_idx as u64)
+        .wrapping_mul(0x9E3779B97F4A7C15)
+        .wrapping_add(0xD1B54A32D192ED03);
+    // d in ~[0.004, 0.020], dmin in ~[0.002, 0.010] — keeps dequant magnitudes sane.
+    let d = 0.004 + (prng(&mut state) % 1000) as f32 / 1000.0 * 0.016;
+    let dmin = 0.002 + (prng(&mut state) % 1000) as f32 / 1000.0 * 0.008;
+    out[0..2].copy_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
+    out[2..4].copy_from_slice(&half::f16::from_f32(dmin).to_bits().to_le_bytes());
+    // scales[12] and qs[128]: full-range pseudo-random bytes.
+    for b in out.iter_mut().take(Q4_K_BYTES).skip(4) {
+        *b = (prng(&mut state) & 0xFF) as u8;
+    }
+}
+
+// llama.cpp's get_scale_min_k4: extract the 6-bit scale and min for sub-block j.
+fn get_scale_min_k4(j: usize, scales: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (scales[j] & 63, scales[j + 4] & 63)
+    } else {
+        let d = (scales[j + 4] & 0xF) | ((scales[j - 4] >> 6) << 4);
+        let m = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+        (d, m)
+    }
+}
+
+// llama.cpp's dequantize_row_q4_K for one 256-weight block.
+fn dequant_q4k_block(block: &[u8], out: &mut [f32; 256]) {
+    let d = half::f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
+    let dmin = half::f16::from_bits(u16::from_le_bytes([block[2], block[3]])).to_f32();
+    let scales = &block[4..16];
+    let qs = &block[16..144];
+    let mut oi = 0usize;
+    let mut is = 0usize;
+    let mut q_off = 0usize;
+    for _ in 0..4 {
+        let (sc1, m1) = get_scale_min_k4(is, scales);
+        let d1 = d * sc1 as f32;
+        let min1 = dmin * m1 as f32;
+        let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+        let d2 = d * sc2 as f32;
+        let min2 = dmin * m2 as f32;
+        for l in 0..32 {
+            out[oi] = d1 * (qs[q_off + l] & 0xF) as f32 - min1;
+            oi += 1;
+        }
+        for l in 0..32 {
+            out[oi] = d2 * (qs[q_off + l] >> 4) as f32 - min2;
+            oi += 1;
+        }
+        q_off += 32;
+        is += 2;
+    }
+}
+
+// CPU reference for one output element D[n*M + m] = sum_k A[m,k] * B[n,k].
+// Accumulates in f64 so the reference is tighter than the GPU's f32 path.
+fn cpu_ref_point(a_data: &[u8], b_data: &[f32], m: u32, n: u32, k: u32) -> f64 {
+    let blocks_per_row = (k / QUANT_K) as usize;
+    let row_block_base = m as usize * blocks_per_row;
+    let mut acc = 0.0f64;
+    let mut dq = [0.0f32; 256];
+    for blk in 0..blocks_per_row {
+        let off = (row_block_base + blk) * Q4_K_BYTES;
+        dequant_q4k_block(&a_data[off..off + Q4_K_BYTES], &mut dq);
+        let k_base = blk * 256;
+        let b_base = n as usize * k as usize + k_base;
+        for kk in 0..256 {
+            acc += dq[kk] as f64 * b_data[b_base + kk] as f64;
+        }
+    }
+    acc
+}
+
 fn main() {
     // ------------------------------------------------------------------ Vulkan setup
     let library = VulkanLibrary::new().expect("no Vulkan library");
@@ -234,13 +323,15 @@ fn main() {
         (d_len * 4) as f64 / 1e3,
     );
 
-    // q4_K block bytes. Zero-fill is a valid (if degenerate) q4_K block:
-    // d=0, dmin=0, scales=0, qs=0 -> dequant returns zero everywhere.
-    // The shader still runs the full load + dequant + FMA + store path,
-    // so timing is meaningful even though D will be all zeros.
-    let a_data: Vec<u8> = vec![0u8; a_bytes];
+    // q4_K block bytes: real, varied, non-degenerate content so the matmul
+    // actually exercises dequant + FMA on meaningful values. This is what makes
+    // the CPU-reference check below able to catch a miscompile.
+    let mut a_data: Vec<u8> = vec![0u8; a_bytes];
+    for (bi, chunk) in a_data.chunks_exact_mut(Q4_K_BYTES).enumerate() {
+        gen_q4k_block(bi, chunk);
+    }
 
-    // B as deterministic non-trivial f32 data (not used for verification).
+    // B as deterministic non-trivial f32 data.
     let b_data: Vec<f32> = (0..b_len)
         .map(|i| (i as f32 * 0.07891 - 0.3).sin() * 0.5)
         .collect();
@@ -374,11 +465,64 @@ fn main() {
     };
     let run_once = || run_batch(1);
 
-    // ------------------------------------------------------------------ Sanity
+    // ------------------------------------------------------------------ Correctness
+    // Run once, then compare a spread of output elements against an f64 CPU
+    // reference. This is the real correctness net: a miscompiled kernel (dropped
+    // wait, bad reorder, corrupted register) shows up here as a numeric mismatch.
     run_once();
     let d_view = d_buf.read().unwrap();
     let any_nan = d_view.iter().any(|x| x.is_nan() || x.is_infinite());
-    println!("output: nan/inf? {}    sample d[0..4]={:?}", any_nan, &d_view[0..4]);
+
+    // Sample points spread across corners, tile boundaries (BM=BN=64), and
+    // interior, hitting many different output tiles.
+    let sample_points: [(u32, u32); 24] = [
+        (0, 0), (1, 1), (63, 63), (64, 0), (0, 64), (64, 64),
+        (37, 411), (100, 7), (512, 256), (1000, 500), (2048, 128), (2049, 129),
+        (3000, 300), (777, 333), (1234, 456), (333, 1), (4000, 500), (m / 2, n / 2),
+        (m - 1, n - 1), (m - 1, 0), (0, n - 1), (m - 1, n / 2), (m / 2, n - 1), (4095, 511),
+    ];
+
+    let mut max_abs = 0.0f64;
+    let mut max_rel = 0.0f64;
+    let mut worst: (u32, u32, f64, f64) = (0, 0, 0.0, 0.0);
+    for &(mm, nn) in &sample_points {
+        let gpu = d_view[nn as usize * m as usize + mm as usize] as f64;
+        let cpu = cpu_ref_point(&a_data, &b_data, mm, nn, k);
+        let abs = (gpu - cpu).abs();
+        let rel = abs / (cpu.abs() + 1e-9);
+        if rel > max_rel {
+            max_rel = rel;
+            worst = (mm, nn, gpu, cpu);
+        }
+        max_abs = max_abs.max(abs);
+    }
+
+    // A few explicit comparisons for eyeballing.
+    for &(mm, nn) in &[(0u32, 0u32), (37, 411), (2048, 128), (m - 1, n - 1)] {
+        let gpu = d_view[nn as usize * m as usize + mm as usize] as f64;
+        let cpu = cpu_ref_point(&a_data, &b_data, mm, nn, k);
+        println!("  D[{:>4},{:>4}]  gpu={:>13.5}  cpu={:>13.5}  rel={:.2e}",
+                 mm, nn, gpu, cpu, (gpu - cpu).abs() / (cpu.abs() + 1e-9));
+    }
+    println!(
+        "correctness: nan/inf={}  max_abs_err={:.3e}  max_rel_err={:.3e}  (over {} sample points)",
+        any_nan, max_abs, max_rel, sample_points.len()
+    );
+
+    // Pass threshold: fp32 GPU vs f64 CPU over a K=14336 reduction agrees to
+    // well under 1%. A miscompile is wrong by orders of magnitude, so 1e-2
+    // cleanly separates correct from broken.
+    let correct = !any_nan && max_rel < 1e-2;
+    if correct {
+        println!("CORRECT: PASS");
+    } else {
+        println!(
+            "CORRECT: FAIL  worst point D[{},{}]: gpu={} cpu={}",
+            worst.0, worst.1, worst.2, worst.3
+        );
+        drop(d_view);
+        std::process::exit(1);
+    }
     drop(d_view);
 
     // ------------------------------------------------------------------ Perf

@@ -325,6 +325,7 @@ name = "perf"
 version = "0.1.0"
 dependencies = [
  "foldhash",
+ "half",
  "vulkano",
  "vulkano-shaders",
 ]
