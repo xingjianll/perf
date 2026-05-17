@@ -1,0 +1,51 @@
+#version 450
+
+/* Pure FFMA microbenchmark.
+ *
+ * 8 independent accumulators in a dependency chain per accumulator, so the
+ * GPU can pipeline 8 FFMAs at a time but each chain is latency-bound. This
+ * approximates the matmul's inner-loop FMA pattern (a thread's accumulators
+ * are independent of each other but each is a self-dependent chain) while
+ * containing zero shared-memory or global-memory loads inside the loop. */
+
+layout(local_size_x = 128) in;
+
+layout(constant_id = 0) const uint OUTER_ITERS = 65536u;
+
+layout(std430, binding = 0) buffer Out { float data[]; };
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint base = id * 10u;
+
+    float a0 = data[base + 0u];
+    float a1 = data[base + 1u];
+    float a2 = data[base + 2u];
+    float a3 = data[base + 3u];
+    float a4 = data[base + 4u];
+    float a5 = data[base + 5u];
+    float a6 = data[base + 6u];
+    float a7 = data[base + 7u];
+    float b  = data[base + 8u];
+    float c  = data[base + 9u];
+
+    for (uint i = 0u; i < OUTER_ITERS; i++) {
+        a0 = fma(b, c, a0);
+        a1 = fma(b, c, a1);
+        a2 = fma(b, c, a2);
+        a3 = fma(b, c, a3);
+        a4 = fma(b, c, a4);
+        a5 = fma(b, c, a5);
+        a6 = fma(b, c, a6);
+        a7 = fma(b, c, a7);
+    }
+
+    data[base + 0u] = a0;
+    data[base + 1u] = a1;
+    data[base + 2u] = a2;
+    data[base + 3u] = a3;
+    data[base + 4u] = a4;
+    data[base + 5u] = a5;
+    data[base + 6u] = a6;
+    data[base + 7u] = a7;
+}
