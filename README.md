@@ -15,8 +15,10 @@ Shaders under `shaders/` are copied verbatim from
 ## Run
 
 ```
-cargo run --release --bin matmul    # Q4_K × F32 matmul
-cargo run --release --bin add       # broadcast ADD F32
+cargo run --release --bin matmul           # Q4_K × F32 matmul
+cargo run --release --bin add              # broadcast ADD F32
+cargo run --release --bin fma_only         # pure-FFMA throughput ceiling
+cargo run --release --bin matmul_fma_only  # matmul w/ inner FMA phase only (no dequant)
 ```
 
 On GCC 15+, `shaderc-sys` 0.8.3's vendored glslang fails to build (missing
@@ -59,6 +61,55 @@ case (Metal hits 1119 GB/s). Our 164 GB/s matches llama.cpp within noise after
 batching 64 dispatches per submit. Without batching the same harness reports
 ~46 GB/s — 75% of the wall time is then submit/fence round-trip, since the
 underlying kernel is only ~148 µs.
+
+### FMA-throughput ceiling — `fma_only`
+
+Tight dependency-chained FFMA loop, 8 independent per-thread accumulators,
+zero memory traffic inside the loop. Gives the peak FFMA pipeline rate the
+GPU can sustain through each driver's compiler.
+
+| Run | Driver | GFLOPS |
+|---|---|---:|
+| 5 | MoltenVK 1.4.313 (macOS)               | 5353 |
+| 6 | Honeykrisp / Mesa 26.2-dev (Asahi Linux) | ~5170 |
+
+Both drivers hit essentially the same ceiling (within ~3%). The AGX FMA
+pipeline runs at the same rate end-to-end regardless of which compiler
+front-end fed it.
+
+### Inner-loop FMA phase — `matmul_fma_only`
+
+`mul_mm.comp` with the global A/B loads inside the K loop guarded out (kept
+on a never-taken branch so descriptors stay referenced). The post-barrier
+shmem-`lload` + `ffma` code is byte-identical to the full matmul, so this
+measures the inner FMA phase alone — same registers, same shmem traffic,
+no dequant.
+
+| Run | Driver | GFLOPS | utilization of FMA ceiling |
+|---|---|---:|---:|
+| 7 | MoltenVK 1.4.313 (macOS)               | 5016 | 94% |
+| 8 | Honeykrisp / Mesa 26.2-dev (Asahi Linux) | ~2400 | 46% |
+
+### Summary of the matmul perf gap
+
+| | MoltenVK | Honeykrisp | ratio | what it isolates |
+|---|---:|---:|---:|---|
+| `fma_only`               | 5353 | ~5170 | 1.04× | raw FMA pipeline |
+| `matmul_fma_only`        | 5016 | ~2400 | 2.09× | inner-loop FMA + shmem load |
+| `matmul` (q4_K full)     | 4303 | 1707  | 2.52× | + dequant |
+
+**Reading**: the AGX FMA pipeline itself is equally fast on both. The 2× gap
+opens up the moment the inner FMA loop runs alongside shmem loads, and dequant
+only adds another ~0.4×. The dominant slowdown is in the inner FMA-phase
+codegen, not the FMA pipeline and not the dequant.
+
+The AGX-dump instruction mix points at why: in `matmul_fma_only`, MoltenVK
+emits 76 `ffma` (rolled inner loop, ~720 ISA lines) while Honeykrisp emits
+1036 `ffma` (fully unrolled, ~13.5k ISA lines). Aggressive unrolling balloons
+register pressure, cuts wave count, and removes the latency hiding the rolled
+MoltenVK code uses to overlap shmem-load latency with FMA. Tested fix from
+the Mesa side: try `[[loop]]` instead of `[[unroll]]` on the inner K loop
+in `mul_mm.comp` and see if the Honeykrisp number rises.
 
 ## AGX disassembly
 
