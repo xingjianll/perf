@@ -1,0 +1,65 @@
+#version 450
+
+/* Occupancy probe. Each workgroup does a fixed quantum of independent FMA
+ * work (no memory traffic), and optionally claims a configurable amount of
+ * shared memory. By dispatching different WG counts and timing each, we can
+ * infer how many workgroups run concurrently per core:
+ *
+ *   With C cores and W WGs/core resident:
+ *     total_waves = ceil(N_workgroups / (C * W))
+ *     time(N)     = total_waves * time_one_wave
+ *
+ * So time(N) plotted against N forms a staircase whose step size is C*W.
+ * Sweeping SHMEM_BYTES tells us how shared-memory pressure changes W. */
+
+layout(local_size_x = 128) in;
+
+layout(constant_id = 0) const uint OUTER_ITERS = 32768u;
+layout(constant_id = 1) const uint SHMEM_FLOATS = 1u;  // total 4*SHMEM_FLOATS bytes
+
+shared float scratch[SHMEM_FLOATS];
+
+layout(std430, binding = 0) buffer Out { float data[]; };
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint base = id * 10u;
+
+    /* Touch shared memory once so allocations aren't dead-stripped. */
+    scratch[t % SHMEM_FLOATS] = float(t);
+    barrier();
+
+    float a0 = data[base + 0u];
+    float a1 = data[base + 1u];
+    float a2 = data[base + 2u];
+    float a3 = data[base + 3u];
+    float a4 = data[base + 4u];
+    float a5 = data[base + 5u];
+    float a6 = data[base + 6u];
+    float a7 = data[base + 7u];
+    float b  = data[base + 8u];
+    float c  = data[base + 9u];
+
+    for (uint i = 0u; i < OUTER_ITERS; i++) {
+        a0 = fma(b, c, a0);
+        a1 = fma(b, c, a1);
+        a2 = fma(b, c, a2);
+        a3 = fma(b, c, a3);
+        a4 = fma(b, c, a4);
+        a5 = fma(b, c, a5);
+        a6 = fma(b, c, a6);
+        a7 = fma(b, c, a7);
+    }
+
+    /* Force the shmem write to be live by mixing it into the output. */
+    float sink = scratch[t % SHMEM_FLOATS];
+    data[base + 0u] = a0 + sink;
+    data[base + 1u] = a1;
+    data[base + 2u] = a2;
+    data[base + 3u] = a3;
+    data[base + 4u] = a4;
+    data[base + 5u] = a5;
+    data[base + 6u] = a6;
+    data[base + 7u] = a7;
+}
