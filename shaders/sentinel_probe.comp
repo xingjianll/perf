@@ -1,0 +1,39 @@
+#version 450
+
+/* Perturb-and-observe probe for the threadgroup store's bits 40-42.
+ *
+ * One workgroup, one shared array. We zero it, then a SINGLE constant-index
+ * store writes a sentinel, then we copy the whole array out. After running we
+ * know exactly which shared-memory slot the sentinel landed in. By patching
+ * byte5 of that store instruction in the compiled binary and re-running, we
+ * see whether bits 40-42 move the write (address), change it (data), or do
+ * nothing (hint). The dynamic init/readback loops pin the layout so offsets
+ * are real (no compaction). */
+
+layout(local_size_x = 32) in;
+
+const uint N = 64u;
+shared float scratch[N];
+
+layout(std430, binding = 0) buffer Out { float data[]; };
+
+layout(constant_id = 0) const uint SENTINEL_INDEX = 5u;
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+
+    for (uint i = t; i < N; i += 32u) {
+        scratch[i] = 0.0;
+    }
+    barrier();
+
+    // The one store under test: immediate-offset, constant index.
+    if (t == 0u) {
+        scratch[SENTINEL_INDEX] = 12345.0;
+    }
+    barrier();
+
+    for (uint i = t; i < N; i += 32u) {
+        data[i] = scratch[i];
+    }
+}

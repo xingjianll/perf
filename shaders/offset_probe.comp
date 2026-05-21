@@ -1,0 +1,58 @@
+#version 450
+
+/* Offset-encoding probe.
+ *
+ * Goal: defeat shared-memory compaction so each constant-index store lands at
+ * its TRUE byte offset, letting us check whether the undocumented bits 40-42
+ * of the lstore encoding are part of the offset immediate or an independent
+ * field.
+ *
+ * The dynamic-index loop below forces the compiler to materialize the full
+ * 8192-float array with a real, dense layout (it can't renumber a dynamically
+ * indexed array), so scratch[i] really is at byte offset i*4. */
+
+layout(local_size_x = 128) in;
+
+shared float scratch[8192];
+
+layout(std430, binding = 0) buffer Out { float data[]; };
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+
+    // Dynamic-index init across the whole array -> forces a real 8192 layout.
+    for (uint i = t; i < 8192u; i += 128u) {
+        scratch[i] = float(i) + data[i & 1023u];
+    }
+    barrier();
+
+    float v = float(t) + data[t];
+
+    // Constant-index stores: these should now compile to immediate-offset
+    // lstores at offsets 0, 4, 32, 256, 2176(=544*4? no, 544 elems), ... bytes.
+    scratch[0]    = v;
+    scratch[1]    = v;
+    scratch[2]    = v;
+    scratch[4]    = v;
+    scratch[8]    = v;
+    scratch[16]   = v;
+    scratch[32]   = v;
+    scratch[64]   = v;
+    scratch[128]  = v;
+    scratch[136]  = v;
+    scratch[256]  = v;
+    scratch[512]  = v;
+    scratch[1024] = v;
+    scratch[2048] = v;
+    scratch[4096] = v;
+    scratch[8000] = v;
+    barrier();
+
+    // Read the whole array back dynamically so nothing is dead-stripped and
+    // the layout is pinned.
+    float s = 0.0;
+    for (uint i = t; i < 8192u; i += 128u) {
+        s += scratch[i];
+    }
+    data[t] = s;
+}

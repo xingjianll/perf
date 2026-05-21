@@ -1,0 +1,46 @@
+#version 450
+
+/* Probe to characterize the one-hot bits 40/41/42 of threadgroup load/store.
+ *
+ * Three hypotheses for what selects the bit:
+ *   (a) offset sign      — bit40 (<=0) vs bit42 (>0); bit41 = ???
+ *   (b) segment selector — which shared array the access targets
+ *   (c) addressing mode  — immediate offset (Ot=1) vs register offset (Ot=0)
+ *
+ * We exercise all three axes in one shader:
+ *   - three DISTINCT shared arrays A,B,C (segment axis)
+ *   - constant offsets 0 and 64 in each (sign/offset axis)
+ *   - one register-indexed (dynamic) store per array (addressing-mode axis)
+ * Dynamic readback at the end pins the layout so offsets are real. */
+
+layout(local_size_x = 128) in;
+
+shared float A[512];
+shared float B[512];
+shared float C[512];
+
+layout(std430, binding = 0) buffer Out { float data[]; };
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    float v = float(t) + data[t];
+    uint di = uint(data[t]) & 511u;   // runtime index -> register-offset store
+
+    // Immediate-offset stores into three distinct arrays.
+    A[0]  = v;  A[64]  = v;
+    B[0]  = v;  B[64]  = v;
+    C[0]  = v;  C[64]  = v;
+
+    // Register-indexed (dynamic) stores -> Ot=0 addressing.
+    A[di] = v;
+    B[di] = v;
+    C[di] = v;
+    barrier();
+
+    // Dynamic readback across all three arrays pins their layout.
+    float s = 0.0;
+    for (uint i = t; i < 512u; i += 128u) {
+        s += A[i] + B[i] + C[i];
+    }
+    data[t] = s;
+}
