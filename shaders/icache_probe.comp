@@ -1,0 +1,53 @@
+#version 450
+// Instruction-cache probe: constant dynamic work, variable static code size.
+//
+// Each thread executes TOTAL = 8 * BODY * OUTER fmas, where BODY * OUTER is
+// held constant by the host (8192). BODY sizes the [[unroll]]-forced inner
+// body (8 fmas per group => ~64B..256KB of straight-line code); OUTER is the
+// [[dont_unroll]] outer loop trip count. If the GPU front-end streams the
+// body from cache, time is flat in BODY; a knee marks the i-cache capacity.
+//
+// The 8 accumulator chains are independent (ALU-throughput bound) and the
+// operands are runtime values (a < 1 so the chains converge; no inf/denorm).
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256) in;
+
+layout(constant_id = 1) const uint BODY = 8;
+layout(constant_id = 2) const uint OUTER = 1024;
+
+layout(binding = 0) buffer Buf {
+    float data[];
+};
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+
+    float a = data[tid % 1024u];           // 0.99999
+    float b = data[1024u + (tid % 1024u)]; // 1e-7
+
+    float c0 = fma(a, 1.0, b);
+    float c1 = fma(a, 2.0, b);
+    float c2 = fma(a, 3.0, b);
+    float c3 = fma(a, 4.0, b);
+    float c4 = fma(a, 5.0, b);
+    float c5 = fma(a, 6.0, b);
+    float c6 = fma(a, 7.0, b);
+    float c7 = fma(a, 8.0, b);
+
+    [[dont_unroll]] for (uint o = 0u; o < OUTER; ++o) {
+        [[unroll]] for (uint i = 0u; i < BODY; ++i) {
+            c0 = fma(c0, a, b);
+            c1 = fma(c1, a, b);
+            c2 = fma(c2, a, b);
+            c3 = fma(c3, a, b);
+            c4 = fma(c4, a, b);
+            c5 = fma(c5, a, b);
+            c6 = fma(c6, a, b);
+            c7 = fma(c7, a, b);
+        }
+    }
+
+    data[2048u + tid] = c0 + c1 + c2 + c3 + c4 + c5 + c6 + c7;
+}
