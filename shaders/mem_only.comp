@@ -1,0 +1,34 @@
+#version 450
+
+/* Memory-bandwidth microbenchmark.
+ *
+ * Each thread reads N_LOADS sequential 32-bit words from a large input buffer
+ * and XORs them into an accumulator (XOR to defeat dead-code elimination).
+ * Sequential reads stress streaming bandwidth, not latency. Pair with
+ * fma_only.comp (which has zero memory traffic) to roofline this driver. */
+
+layout(local_size_x = 128) in;
+
+layout(constant_id = 0) const uint N_LOADS = 512u;
+
+layout(std430, binding = 0) readonly  buffer In  { uint in_data[];  };
+layout(std430, binding = 1) writeonly buffer Out { uint out_data[]; };
+
+/* Coalesced layout: lane `t` in workgroup `g` reads
+ *   in_data[g * (WG_SIZE * N_LOADS) + i * WG_SIZE + t]
+ * so adjacent lanes in a subgroup hit adjacent words (one cacheline per
+ * subgroup-load). This is the bandwidth-peak access pattern. */
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint g = gl_WorkGroupID.x;
+    uint wg_size = gl_WorkGroupSize.x;
+    uint group_base = g * (wg_size * N_LOADS);
+    uint acc = 0u;
+
+    for (uint i = 0u; i < N_LOADS; i++) {
+        acc ^= in_data[group_base + i * wg_size + t];
+    }
+
+    out_data[g * wg_size + t] = acc;
+}

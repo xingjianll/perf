@@ -1,0 +1,77 @@
+#version 450
+
+/* WAR-hazard probe.
+ *
+ * Tests whether AGX has a hardware WAR hazard on shared-memory load source
+ * registers. Two modes selected via SHARED_ADDR spec constant:
+ *
+ *   SHARED_ADDR=1 (WAR pattern): every iteration recomputes the same
+ *     address register, immediately reads it via lload, then recomputes
+ *     again. The compiler should produce a single address register reused
+ *     across all loads (after RA).
+ *
+ *   SHARED_ADDR=0 (no-WAR pattern): every iteration uses a DIFFERENT
+ *     address (different offset within shmem), forcing the compiler to
+ *     allocate distinct registers post-RA.
+ *
+ * If AGX stalls on WAR, mode 1 should be measurably slower than mode 0. */
+
+layout(local_size_x = 128) in;
+
+layout(constant_id = 0) const uint OUTER_ITERS = 16384u;
+layout(constant_id = 1) const uint SHARED_ADDR = 1u;
+
+shared uint scratch[256];
+
+layout(std430, binding = 0) buffer Out { uint data[]; };
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+
+    /* Pre-populate shmem from input so values are non-constant. */
+    scratch[tid] = data[tid] + tid;
+    scratch[tid + 128] = data[tid + 128] + tid;
+    barrier();
+
+    uint acc0 = 0u, acc1 = 0u, acc2 = 0u, acc3 = 0u;
+    uint acc4 = 0u, acc5 = 0u, acc6 = 0u, acc7 = 0u;
+
+    for (uint iter = 0u; iter < OUTER_ITERS; iter++) {
+        if (SHARED_ADDR == 1u) {
+            /* WAR pattern: every load uses the same address pattern that
+             * RA should collapse to a single physical register. */
+            uint base = tid;
+            acc0 ^= scratch[base + 0u];
+            acc1 ^= scratch[base + 1u];
+            acc2 ^= scratch[base + 2u];
+            acc3 ^= scratch[base + 3u];
+            acc4 ^= scratch[base + 4u];
+            acc5 ^= scratch[base + 5u];
+            acc6 ^= scratch[base + 6u];
+            acc7 ^= scratch[base + 7u];
+        } else {
+            /* No-WAR pattern: distinct offsets force distinct address
+             * computations. Mathematically equivalent to above (same
+             * memory locations read), just expressed so the compiler
+             * gives each load its own SSA address value. */
+            uint b0 = tid + 0u;
+            uint b1 = tid + 1u;
+            uint b2 = tid + 2u;
+            uint b3 = tid + 3u;
+            uint b4 = tid + 4u;
+            uint b5 = tid + 5u;
+            uint b6 = tid + 6u;
+            uint b7 = tid + 7u;
+            acc0 ^= scratch[b0];
+            acc1 ^= scratch[b1];
+            acc2 ^= scratch[b2];
+            acc3 ^= scratch[b3];
+            acc4 ^= scratch[b4];
+            acc5 ^= scratch[b5];
+            acc6 ^= scratch[b6];
+            acc7 ^= scratch[b7];
+        }
+    }
+
+    data[tid] = acc0 ^ acc1 ^ acc2 ^ acc3 ^ acc4 ^ acc5 ^ acc6 ^ acc7;
+}

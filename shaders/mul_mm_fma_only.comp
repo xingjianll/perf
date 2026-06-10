@@ -151,7 +151,10 @@ void main() {
         pos_a += BK / LOAD_VEC_A;
         pos_b += BK / LOAD_VEC_B;
 
-        [[unroll]] for (uint i = 0; i < BK / BK_STEP; i++) {
+        // EXPERIMENT: drop [[unroll]] on BK loop. MoltenVK keeps this rolled
+        // (per shader dump), Mesa honors the hint and unrolls into a 1036-FFMA
+        // body. Test whether keeping BK rolled closes the FMA-phase gap.
+        for (uint i = 0; i < BK / BK_STEP; i++) {
             // Load tile slice from shmem into per-thread cache.
             [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
                 [[unroll]] for (uint j = 0; j < TM; j++) {
