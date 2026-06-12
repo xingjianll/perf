@@ -69,7 +69,15 @@ fn main() {
     )
     .unwrap();
 
-    let physical = instance.enumerate_physical_devices().unwrap().next().unwrap();
+    let gpu_index: usize = std::env::var("GPU_INDEX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let physical = instance
+        .enumerate_physical_devices()
+        .unwrap()
+        .nth(gpu_index)
+        .unwrap();
     eprintln!("device: {}", physical.properties().device_name);
 
     let queue_family_index = physical
